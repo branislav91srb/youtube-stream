@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover"
+    >
+    <title>YouTube Stream</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            color: #fff;
+            width: 100%;
+            height: 100%;
+        }
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
+        /* Native scrubber lies for live-window VOD restreams. */
+        body.vod video::-webkit-media-controls-timeline {
+            display: none !important;
+        }
+        body.vod video::-webkit-media-controls-current-time-display,
+        body.vod video::-webkit-media-controls-time-remaining-display {
+            display: none !important;
+        }
+        #status {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            padding: 6px 10px;
+            background: rgba(0,0,0,.7);
+            border-radius: 6px;
+            font-family: Arial, sans-serif;
+            font-size: 13px;
+            z-index: 10;
+        }
+        #unmute {
+            display: none;
+            position: fixed;
+            right: 12px;
+            bottom: 12px;
+            padding: 10px 14px;
+            background: rgba(255,255,255,.9);
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            z-index: 11;
+            cursor: pointer;
+        }
+        #vodBar {
+            display: none;
+            position: fixed;
+            left: 12px;
+            right: 12px;
+            bottom: 52px;
+            z-index: 12;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            pointer-events: none;
+        }
+        #vodBar .row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+            text-shadow: 0 1px 2px #000;
+        }
+        #vodTrack {
+            height: 6px;
+            background: rgba(255,255,255,.25);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        #vodFill {
+            height: 100%;
+            width: 0%;
+            background: #fff;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <video
+        id="video"
+        controls
+        playsinline
+        webkit-playsinline
+        muted
+        autoplay
+    ></video>
+
+    <div id="vodBar">
+        <div class="row">
+            <span id="vodElapsed">0:00</span>
+            <span id="vodRemaining">0:00</span>
+        </div>
+        <div id="vodTrack"><div id="vodFill"></div></div>
+    </div>
+
+    <div id="status">Starting stream...</div>
+    <button id="unmute" type="button">Tap for sound</button>
+
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17"></script>
+    <script>
+        const video = document.getElementById("video");
+        const status = document.getElementById("status");
+        const unmuteBtn = document.getElementById("unmute");
+        const vodBar = document.getElementById("vodBar");
+        const vodFill = document.getElementById("vodFill");
+        const vodElapsed = document.getElementById("vodElapsed");
+        const vodRemaining = document.getElementById("vodRemaining");
+        const videoId = "{{VIDEO_ID}}";
+        const sessionId = "{{SESSION_ID}}";
+        const hlsUrl = "/hls/" + videoId + "/index.m3u8";
+        const statusUrl = "/status/" + videoId;
+        const eventsUrl = "/events/" + videoId;
+
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+            || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+        let attached = false;
+        let hls = null;
+        let pollTimer = null;
+        let statusTimer = null;
+        let attempts = 0;
+        const maxAttempts = 120;
+        let reconnectAttempt = 0;
+        let vodMode = false;
+        let vodFrozenPos = null;
+        let vodLastPos = 0;
+        let lastReportedError = "";
+        let reportedPlaying = false;
+
+        function setStatus(text) {
+            status.textContent = text;
+        }
+
+        function reportEvent(event, detail, extra) {
+            const key = event + ":" + (detail || "");
+            // Avoid spamming the same error every second.
+            if (event.indexOf("error") >= 0 || event.indexOf("timeout") >= 0) {
+                if (key === lastReportedError) {
+                    return;
+                }
+                lastReportedError = key;
+            }
+
+            const body = {
+                event: event,
+                level: (extra && extra.level) || "info",
+                detail: detail || null,
+                fatal: extra && extra.fatal,
+                type: extra && extra.type,
+                sid: sessionId
+            };
+
+            fetch(eventsUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-Session-Id": sessionId
+                },
+                body: JSON.stringify(body),
+                keepalive: true,
+                cache: "no-store",
+                credentials: "same-origin"
+            }).catch(() => {
+                // If even the event POST fails, log locally — server never saw it.
+                console.warn("event_post_failed", event, detail);
+            });
+        }
+
+        function reportPlayingOnce() {
+            if (reportedPlaying) {
+                return;
+            }
+            reportedPlaying = true;
+            reportEvent("playing", "playback_started", { level: "info" });
+        }
+
+        function formatTime(seconds) {
+            seconds = Math.max(0, Math.floor(seconds || 0));
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            if (h > 0) {
+                return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+            }
+            return m + ":" + String(s).padStart(2, "0");
+        }
+
+        function updateVodProgress(info) {
+            if (!info || info.is_live || !info.duration) {
+                vodBar.style.display = "none";
+                document.body.classList.remove("vod");
+                vodMode = false;
+                vodFrozenPos = null;
+                return;
+            }
+
+            vodMode = true;
+            document.body.classList.add("vod");
+            vodBar.style.display = "block";
+
+            const duration = Number(info.duration);
+            let position = Number(
+                info.position != null ? info.position : 0
+            );
+
+            // Freeze the bar while paused. Server FFmpeg still advances.
+            if (video.paused && !video.ended && info.phase !== "ended") {
+                if (vodFrozenPos == null) {
+                    vodFrozenPos = vodLastPos || position;
+                }
+                position = vodFrozenPos;
+            } else {
+                vodFrozenPos = null;
+                vodLastPos = position;
+            }
+
+            position = Math.min(duration, Math.max(0, position));
+            const pct = duration > 0 ? (position / duration) * 100 : 0;
+            vodFill.style.width = pct + "%";
+            vodElapsed.textContent = formatTime(position);
+            vodRemaining.textContent = formatTime(duration);
+
+            if (info.phase === "ended") {
+                setStatus("Ended");
+            } else if (attached && (status.textContent === "Live" || status.textContent === "Playing")) {
+                setStatus(video.paused ? "Paused" : "Playing");
+            }
+        }
+
+        video.addEventListener("pause", () => {
+            if (vodMode) {
+                vodFrozenPos = vodLastPos;
+                setStatus("Paused");
+            }
+        });
+
+        video.addEventListener("play", () => {
+            if (vodMode) {
+                vodFrozenPos = null;
+                setStatus("Playing");
+            }
+            reportPlayingOnce();
+        });
+
+        unmuteBtn.addEventListener("click", () => {
+            video.muted = false;
+            video.play()
+                .then(() => {
+                    unmuteBtn.style.display = "none";
+                })
+                .catch(() => setStatus("Press Play"));
+        });
+
+        function tryAutoplay() {
+            // Browsers only allow reliable autoplay when muted.
+            video.muted = true;
+            unmuteBtn.textContent = "Tap for sound";
+            unmuteBtn.style.display = "block";
+            return video.play()
+                .catch(() => {
+                    setStatus("Press Play");
+                    unmuteBtn.textContent = "Tap to play";
+                    unmuteBtn.style.display = "block";
+                });
+        }
+
+        async function fetchStatus() {
+            try {
+                const res = await fetch(statusUrl, { cache: "no-store" });
+                if (!res.ok) {
+                    return null;
+                }
+                return await res.json();
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function playlistReady() {
+            const res = await fetch(hlsUrl, { cache: "no-store" });
+            if (!res.ok) {
+                return false;
+            }
+            const text = await res.text();
+            // MediaMTX index.m3u8 is a master playlist (#EXT-X-STREAM-INF).
+            return (
+                text.includes("#EXTINF") ||
+                text.includes("#EXT-X-STREAM-INF") ||
+                text.includes("main_stream.m3u8")
+            );
+        }
+
+        function attachNative() {
+            video.src = hlsUrl;
+            video.addEventListener("loadedmetadata", () => {
+                setStatus(vodMode ? "Playing" : "Live");
+                tryAutoplay();
+            });
+            video.addEventListener("waiting", () => setStatus("Buffering..."));
+            video.addEventListener("playing", () => {
+                setStatus(vodMode ? "Playing" : "Live");
+                unmuteBtn.style.display = "none";
+                reportPlayingOnce();
+            });
+            video.addEventListener("error", () => {
+                const code = video.error ? video.error.code : null;
+                reportEvent("video_error", "media_element_error", {
+                    level: "error",
+                    fatal: true,
+                    type: code
+                });
+                setStatus("Playback error — retrying...");
+                attached = false;
+                video.removeAttribute("src");
+                video.load();
+                schedulePoll(2000);
+            });
+            tryAutoplay();
+        }
+
+        function attachHlsJs() {
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+
+            hls = new Hls({
+                enableWorker: true,
+                lowLatencyMode: false,
+                liveDurationInfinity: true,
+                maxLiveSyncPlaybackRate: 1,
+                backBufferLength: 60,
+                maxBufferLength: 90,
+                maxMaxBufferLength: 180,
+                liveSyncDurationCount: 8,
+                liveMaxLatencyDurationCount: 30
+            });
+
+            hls.loadSource(hlsUrl);
+            hls.attachMedia(video);
+
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                reconnectAttempt = 0;
+                setStatus(vodMode ? "Playing" : "Live");
+                tryAutoplay();
+            });
+
+            hls.on(Hls.Events.ERROR, (event, data) => {
+                console.log("HLS error:", data);
+                if (!data.fatal) {
+                    return;
+                }
+
+                reportEvent("hls_fatal", data.details || data.type, {
+                    level: "error",
+                    fatal: true,
+                    type: data.type
+                });
+                setStatus("Reconnecting...");
+
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    reconnectAttempt += 1;
+                    const delay = Math.min(8000, 1500 * reconnectAttempt);
+                    setTimeout(() => {
+                        if (hls) {
+                            hls.destroy();
+                            hls = null;
+                        }
+                        attached = false;
+                        schedulePoll(delay);
+                    }, delay);
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    hls.recoverMediaError();
+                } else {
+                    hls.destroy();
+                    hls = null;
+                    attached = false;
+                    schedulePoll(2000);
+                }
+            });
+        }
+
+        function attachPlayer() {
+            if (attached) {
+                return;
+            }
+            attached = true;
+
+            if (isIOS) {
+                attachNative();
+            } else if (window.Hls && Hls.isSupported()) {
+                attachHlsJs();
+            } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+                attachNative();
+            } else {
+                reportEvent("unsupported", "hls_not_supported", {
+                    level: "error",
+                    fatal: true
+                });
+                setStatus("HLS is not supported");
+            }
+        }
+
+        function schedulePoll(delayMs) {
+            if (pollTimer) {
+                clearTimeout(pollTimer);
+            }
+            pollTimer = setTimeout(pollForPlaylist, delayMs);
+        }
+
+        async function pollForPlaylist() {
+            if (attached) {
+                return;
+            }
+
+            attempts += 1;
+            setStatus("Waiting for HLS...");
+
+            const info = await fetchStatus();
+            updateVodProgress(info);
+            if (info && info.last_error && !info.running) {
+                reportEvent("stream_error", info.last_error, {
+                    level: "error",
+                    fatal: true
+                });
+                setStatus("Stream error: " + info.last_error);
+            } else if (info && info.phase === "resolving") {
+                setStatus("Resolving YouTube...");
+            } else if (info && info.phase === "publishing") {
+                setStatus("Publishing to MediaMTX...");
+            }
+
+            try {
+                if (await playlistReady()) {
+                    setStatus("Connecting...");
+                    attachPlayer();
+                    return;
+                }
+            } catch (e) {
+                // Playlist not ready yet.
+            }
+
+            if (attempts >= maxAttempts) {
+                reportEvent("timeout", "waiting_for_hls", {
+                    level: "error",
+                    fatal: true
+                });
+                setStatus("Timed out waiting for stream");
+                return;
+            }
+
+            schedulePoll(1000);
+        }
+
+        statusTimer = setInterval(async () => {
+            const info = await fetchStatus();
+            if (!info) {
+                return;
+            }
+            updateVodProgress(info);
+            if (info.phase === "ended") {
+                setStatus("Ended");
+                return;
+            }
+            if (attached) {
+                return;
+            }
+            if (info.last_error && !info.running) {
+                setStatus("Stream error: " + info.last_error);
+            }
+        }, 1000);
+
+        pollForPlaylist();
+    </script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+name: yt
+services:
+
+  youtube-stream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: youtube-stream
+    ports:
+      # Single public origin for Unraid Cloudflare Tunnel + LAN.
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      MEDIAMTX_HOST: "mediamtx"
+      MEDIAMTX_RTSP_PORT: "8554"
+      MEDIAMTX_HLS_PORT: "8888"
+      MEDIAMTX_HLS_CDN_SECRET: "yt-restream-hls-proxy"
+    depends_on:
+      - mediamtx
+    restart: unless-stopped
+
+  mediamtx:
+    image: bluenviron/mediamtx:1
+    container_name: mediamtx
+    # RTSP + HLS stay on the Docker network only.
+    # FFmpeg publishes via mediamtx:8554; the app proxies HLS on :8080.
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped

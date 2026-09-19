@@ -1,0 +1,43 @@
+logLevel: info
+
+###############################################
+# RTSP
+###############################################
+
+rtsp: true
+rtspAddress: :8554
+rtspTransports: [tcp]
+
+###############################################
+# HLS
+###############################################
+
+hls: true
+hlsAddress: :8888
+
+# MPEG-TS is the most compatible option for iPhone/Safari.
+hlsVariant: mpegts
+
+# ~2s segments from encoder; keep ~60s of rewind window.
+hlsSegmentCount: 30
+
+# Part duration hint for remuxer.
+hlsSegmentDuration: 2s
+
+# Generate HLS even before a client requests it.
+hlsAlwaysRemux: true
+
+# Allow access from our player.
+hlsAllowOrigins: ["*"]
+
+# Treat our app proxy as a CDN so MediaMTX skips the
+# cookie-check 302 that breaks reverse proxies.
+# Must match MEDIAMTX_HLS_CDN_SECRET on youtube-stream.
+hlsCDNSecret: yt-restream-hls-proxy
+
+###############################################
+# Paths
+###############################################
+
+paths:
+  all_others:
